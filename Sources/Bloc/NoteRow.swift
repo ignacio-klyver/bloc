@@ -8,6 +8,9 @@ struct NoteRow: View {
     var showDay: Bool = false
     var isFocused: Bool
     var isExpanded: Bool
+    /// Whether a reminder can be offered at all. With no workspace connected the menu says
+    /// so instead of offering an action that would quietly do nothing.
+    var slackConnected: Bool = false
     var onToggle: () -> Void
     var onStar: () -> Void
     var onDelete: () -> Void
@@ -16,6 +19,8 @@ struct NoteRow: View {
     /// Called when inline editing ends (commit or cancel), so the owner can put keyboard
     /// focus back on the row. Without it, leaving the editor dropped focus on the floor.
     var onEndEdit: () -> Void = {}
+    var onSchedule: (Date) -> Void = { _ in }
+    var onCancelReminder: () -> Void = {}
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
@@ -51,6 +56,10 @@ struct NoteRow: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 if editing { editor } else { label }
+                // The reminder shows at both levels of detail: it is a promise the app made
+                // on the user's behalf, and a promise you have to expand a row to find is a
+                // promise you will be surprised by.
+                if note.remindAt != nil && !editing { reminderBadge }
                 if isExpanded && !editing { meta }
             }
 
@@ -120,6 +129,8 @@ struct NoteRow: View {
             Button("Editar", action: beginEdit)
             Button(note.starred ? "Sacar el destacado" : "Destacar", action: onStar)
             Divider()
+            slackMenu
+            Divider()
             Button("Borrar", role: .destructive, action: onDelete)
         }
         .accessibilityElement(children: .combine)
@@ -129,10 +140,38 @@ struct NoteRow: View {
         .accessibilityHint("Espacio para tildar, Enter para abrir, Suprimir para borrar")
     }
 
+    /// Scheduling an old note from the menu, and calling one off. The submenu offers the
+    /// same four times the capture row does, so there is one vocabulary in the app and not
+    /// a second one hiding in a right click.
+    @ViewBuilder
+    private var slackMenu: some View {
+        if !slackConnected {
+            Button("Enviar a Slack…") {}
+                .disabled(true)
+        } else {
+            Menu(note.remindAt == nil ? "Enviar a Slack" : "Reprogramar en Slack") {
+                ForEach(When.suggestions, id: \.self) { suggestion in
+                    if let date = When.date(from: suggestion) {
+                        Button(suggestion) { onSchedule(date) }
+                    }
+                }
+            }
+        }
+        if note.isUpcoming() {
+            Button("Cancelar el recordatorio", action: onCancelReminder)
+        }
+    }
+
     /// The day is spoken as part of the note rather than shown on its own row, so the
     /// cross-day list keeps its context without paying a row per note for it.
     private var accessibilityText: String {
-        showDay ? "\(note.text). \(DayFormat.long(note.day))" : note.text
+        var text = showDay ? "\(note.text). \(DayFormat.long(note.day))" : note.text
+        if let remindAt = note.remindAt {
+            text += note.isUpcoming()
+                ? ". Se envía a Slack \(When.label(remindAt))"
+                : ". Enviada a Slack \(When.label(remindAt))"
+        }
+        return text
     }
 
     /// Collapsed, the row is a summary; the click promises the rest and expanding keeps it.
@@ -153,6 +192,35 @@ struct NoteRow: View {
             .onTapGesture { isExpanded ? beginEdit() : onExpand() }
             .accessibilityAddTraits(.isButton)
             .accessibilityHint(isExpanded ? "Tocá para editar" : "Tocá para abrir")
+    }
+
+    /// What Slack is going to do with this note, in three states that read differently
+    /// on purpose: waiting on Slack, already delivered, and never handed over at all.
+    @ViewBuilder
+    private var reminderBadge: some View {
+        if let remindAt = note.remindAt {
+            let upcoming = remindAt > Date()
+            let queued = note.slackID != nil
+
+            HStack(spacing: 5) {
+                Image(systemName: upcoming
+                      ? (queued ? "paperplane.fill" : "exclamationmark.triangle")
+                      : "checkmark.circle")
+                    .font(.system(size: 9, weight: .medium))
+                Text(reminderText(remindAt, upcoming: upcoming, queued: queued))
+                    .font(.system(size: Theme.Size.foot))
+            }
+            // Accent is a marker, and a reminder waiting to fire is exactly that. Once it
+            // has gone out, or if it never got queued, it stops being a live signal.
+            .foregroundStyle(upcoming && queued ? Theme.accent : Theme.inkSecondary)
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private func reminderText(_ date: Date, upcoming: Bool, queued: Bool) -> String {
+        if !upcoming { return "enviada · \(When.label(date))" }
+        if !queued { return "sin agendar · \(When.label(date))" }
+        return "Slack · \(When.label(date))"
     }
 
     /// The second level of detail: where the note lives and what state it is in.

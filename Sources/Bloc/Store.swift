@@ -13,6 +13,17 @@ final class Store: ObservableObject {
     @Published private(set) var days: [DayKey] = []
     @Published var writeError: String?
 
+    /// What happened with Slack the last time a reminder was handed over. Nil while there is
+    /// nothing to say. Kept apart from `writeError`, which is about the note itself: the note
+    /// is always saved first, so a Slack failure is news, never data loss.
+    @Published var slackNotice: String?
+
+    /// Whether reminders can be handed over at all. Read once per session rather than per
+    /// note, so a capture never waits on the filesystem.
+    private(set) var slack: SlackConfig?
+
+    var slackConnected: Bool { slack != nil }
+
     /// Bumped on every reload, which happens each time the popover opens. The view watches it
     /// to return to today: the controller is built once at launch and lives for weeks, so
     /// without this the popover still opened on yesterday after midnight.
@@ -23,8 +34,34 @@ final class Store: ObservableObject {
 
     let folder: URL
 
-    init(folder: URL? = nil) {
+    /// Where the workspace comes from. Only `.connected` ever touches the network.
+    enum SlackAccess {
+        /// The workspace configured on disk. What the app runs on.
+        case connected
+        /// No workspace at all: the self-test has no business talking to a real one.
+        case off
+        /// A workspace that exists only so an offscreen render can show the states that
+        /// depend on one. Nothing is ever sent.
+        case pretend(SlackConfig)
+    }
+
+    private let access: SlackAccess
+
+    /// True only when a real workspace is behind it, so a render can look connected without
+    /// a request ever leaving the machine.
+    private var live: Bool {
+        if case .connected = access { return true }
+        return false
+    }
+
+    init(folder: URL? = nil, slack access: SlackAccess = .connected) {
         self.folder = folder ?? Store.defaultFolder()
+        self.access = access
+        switch access {
+        case .connected: self.slack = SlackStore.load()
+        case .off: self.slack = nil
+        case .pretend(let config): self.slack = config
+        }
         reload()
     }
 
@@ -70,12 +107,31 @@ final class Store: ObservableObject {
     /// to today, but only re-reads the disk when something actually changed out there.
     /// Parsing every file on each open was work done before the caret appeared.
     func openSession() {
+        // Cheap, and it is the only moment the app can notice that Slack was connected from
+        // the command line while the panel was closed.
+        if live { slack = SlackStore.load() }
+        slackNotice = nil
+
         let current = fingerprint()
         if let last = lastFingerprint, last == current {
             sessionToken &+= 1
-            return
+        } else {
+            reload()
         }
-        reload()
+        retryPending()
+    }
+
+    /// Picks up the reminders that never made it to Slack: the app was quit mid-request, the
+    /// network was down, the workspace was connected only afterwards. Without this a note
+    /// that failed once would sit there with its hour and never be sent, and the only sign
+    /// would be a badge nobody reads twice.
+    private func retryPending() {
+        guard live, slack != nil else { return }
+        let now = Date()
+        for note in byDay.values.flatMap({ $0 })
+        where note.slackID == nil && (note.remindAt.map { $0 > now } ?? false) {
+            handOver(note)
+        }
     }
 
     func reload() {
@@ -145,14 +201,23 @@ final class Store: ObservableObject {
 
     // MARK: - Writing
 
+    /// Files a note, and when a time came with it, hands that note to Slack to deliver.
+    ///
+    /// The file is written first and the network comes after: capture is the promise this
+    /// app makes, and it is never made to wait on a request that might take a second or
+    /// fail outright. A reminder that could not be handed over leaves the note on disk with
+    /// its hour and no Slack id, which is what the row then says out loud.
     @discardableResult
-    func add(_ text: String) -> Bool {
+    func add(_ text: String, remindAt: Date? = nil) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let day = DayKey.today
         var notes = byDay[day] ?? []
-        notes.append(Note(text: trimmed, day: day))
-        return commit(notes, to: day)
+        let note = Note(text: trimmed, day: day, remindAt: remindAt)
+        notes.append(note)
+        guard commit(notes, to: day) else { return false }
+        if remindAt != nil { handOver(note) }
+        return true
     }
 
     @discardableResult
@@ -168,11 +233,21 @@ final class Store: ObservableObject {
     /// Empty text is refused rather than treated as a delete. A note vanishing from the editor
     /// with no crumple, no banner and no announcement reads as data loss, so deleting stays
     /// an explicit action.
+    ///
+    /// Editing a note that is still waiting to be sent rewrites the Slack message too: the
+    /// old one is called off and the new text takes its place at the same hour. Leaving the
+    /// original queued would deliver a version of the note the user already corrected.
     @discardableResult
     func update(_ note: Note, text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        return mutate(note) { $0.text = trimmed }
+        guard !trimmed.isEmpty, trimmed != note.text else { return false }
+        guard mutate(note, { $0.text = trimmed }) else { return false }
+
+        if note.isUpcoming(), let updated = find(note.id) {
+            callOff(note)
+            handOver(updated)
+        }
+        return true
     }
 
     @discardableResult
@@ -185,6 +260,9 @@ final class Store: ObservableObject {
         // memory and marked as deleted, so the next undo inserted a duplicate.
         guard commit(notes, to: note.day) else { return false }
         lastDeleted = snapshot
+        // The note is gone, so the message it was going to send has to go with it. The undo
+        // hands it back to Slack.
+        callOff(snapshot.note)
         return true
     }
 
@@ -193,9 +271,89 @@ final class Store: ObservableObject {
     func undoDelete() -> Bool {
         guard let (note, index) = lastDeleted else { return false }
         var notes = byDay[note.day] ?? []
-        notes.insert(note, at: min(index, notes.count))
+        var restored = note
+        // The old Slack id died with the cancellation, so the reminder is queued again from
+        // scratch rather than restored with a handle that no longer resolves.
+        restored.slackID = nil
+        notes.insert(restored, at: min(index, notes.count))
         lastDeleted = nil
-        return commit(notes, to: note.day)
+        guard commit(notes, to: note.day) else { return false }
+        if restored.isUpcoming() { handOver(restored) }
+        return true
+    }
+
+    /// Calls off a reminder without touching the note. The explicit way out for a note that
+    /// is still going to be written, but no longer needs to be announced.
+    @discardableResult
+    func cancelReminder(_ note: Note) -> Bool {
+        guard note.remindAt != nil else { return false }
+        callOff(note)
+        return mutate(note) { $0.remindAt = nil; $0.slackID = nil }
+    }
+
+    /// Attaches a reminder to a note that was captured without one.
+    @discardableResult
+    func schedule(_ note: Note, at date: Date) -> Bool {
+        callOff(note)
+        guard mutate(note, { $0.remindAt = date; $0.slackID = nil }),
+              let updated = find(note.id) else { return false }
+        handOver(updated)
+        return true
+    }
+
+    // MARK: - Slack
+
+    private func find(_ id: UUID) -> Note? {
+        byDay.values.flatMap { $0 }.first { $0.id == id }
+    }
+
+    /// Hands a note's reminder to Slack and writes the id it gives back into the file.
+    ///
+    /// Slack holds the schedule from here on: the message is delivered at its hour whether
+    /// or not this Mac is awake. That is the whole reason the reminder is not a local timer.
+    private func handOver(_ note: Note) {
+        guard live, let remindAt = note.remindAt else { return }
+        guard let config = slack else {
+            slackNotice = "Guardada con la hora, pero Slack no está conectado. "
+                + "Corré Bloc --slack-connect."
+            return
+        }
+        guard remindAt > Date() else {
+            slackNotice = "Guardada, pero esa hora ya pasó: no la agendé."
+            return
+        }
+
+        let text = note.text
+        let id = note.id
+        Task { @MainActor in
+            do {
+                let scheduled = try await SlackAPI.schedule(text: text, at: remindAt,
+                                                            config: config)
+                // The note may have been deleted or edited while the request was in flight.
+                guard let current = find(id), current.remindAt == remindAt else { return }
+                _ = mutate(current) { $0.slackID = scheduled }
+                slackNotice = nil
+            } catch {
+                slackNotice = "No se pudo agendar en Slack: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Best effort: the note has already stopped existing locally, so a failure here is
+    /// worth reporting but never worth blocking or undoing anything for.
+    private func callOff(_ note: Note) {
+        guard live, let config = slack, let scheduled = note.slackID,
+              note.isUpcoming() else { return }
+        Task { @MainActor in
+            do {
+                try await SlackAPI.cancel(id: scheduled, config: config)
+            } catch SlackError.api("invalid_scheduled_message_id") {
+                // Already delivered or already gone. Nothing to report.
+            } catch {
+                slackNotice = "No pude cancelar el mensaje en Slack: "
+                    + error.localizedDescription
+            }
+        }
     }
 
     /// Disarms the undo. Called when the offer expires or the user moves on, so a reflex ⌘Z

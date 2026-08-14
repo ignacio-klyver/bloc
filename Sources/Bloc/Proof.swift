@@ -14,7 +14,7 @@ enum Proof {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         seed(folder)
 
-        let store = Store(folder: folder)
+        let store = Store(folder: folder, slack: .pretend(Proof.sampleSlack))
         let scale: CGFloat = 2
         let gap: CGFloat = 24
 
@@ -94,8 +94,8 @@ enum Proof {
         seed(full)
         seedLong(full)
 
-        let busyStore = Store(folder: full)
-        let emptyStore = Store(folder: empty)
+        let busyStore = Store(folder: full, slack: .pretend(Proof.sampleSlack))
+        let emptyStore = Store(folder: empty, slack: .off)
 
         var cases: [(String, Store, ContentView.Initial, NSAppearance)] = []
         let aqua = NSAppearance(named: .aqua)!
@@ -108,6 +108,15 @@ enum Proof {
                       .init(query: "zzz"), aqua))
         cases.append(("lista larga (overflow)", busyStore, .init(tab: .pending), dark))
         cases.append(("deshacer visible", busyStore, .init(showUndo: true), aqua))
+        // The three states the Slack reminder introduces: the receipt in the create row,
+        // the same thing refused because nothing is connected, and the ⌘⏎ row.
+        cases.append(("crear + agendar", busyStore,
+                      .init(query: "avisarle a Marina @mañana 9:30"), aqua))
+        cases.append(("crear sin Slack", emptyStore,
+                      .init(query: "avisarle a Marina @mañana 9:30"), aqua))
+        cases.append(("agendar (⌘⏎)", busyStore,
+                      .init(query: "mandar el resumen",
+                            scheduling: true, whenDraft: "lunes 9:00"), dark))
 
         var shots: [(String, NSBitmapImageRep, NSSize)] = []
         for (label, store, initial, appearance) in cases {
@@ -213,7 +222,7 @@ enum Proof {
             .appendingPathComponent("bloc-measure-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         if state != "vacio" { seed(folder) }
-        let store = Store(folder: folder)
+        let store = Store(folder: folder, slack: .pretend(Proof.sampleSlack))
 
         var initial = ContentView.Initial()
         switch state {
@@ -254,10 +263,13 @@ enum Proof {
     /// checkbox, star, text and action icons can be measured pixel by pixel. This is the state
     /// the full-popover renders never show, because hover and focus need a live window.
     static func renderRow(to path: String) {
+        // With a reminder attached, so the badge's baseline against the checkbox and the
+        // star can be measured too, not only the single-line case.
         let note = Note(text: "Armar product general overview en metabase",
-                        starred: true, day: .today)
+                        starred: true, day: .today,
+                        remindAt: Date().addingTimeInterval(3_600), slackID: "Q1PROOF")
         let host = NSHostingView(rootView:
-            NoteRow(note: note, isFocused: true, isExpanded: false,
+            NoteRow(note: note, isFocused: true, isExpanded: false, slackConnected: true,
                     onToggle: {}, onStar: {}, onDelete: {}, onEdit: { _ in }, onExpand: {})
                 .frame(width: 326)
                 .background(Color.white)
@@ -284,11 +296,26 @@ enum Proof {
         }
     }
 
+    /// A workspace that only ever exists inside a render. The token is not a token.
+    private static let sampleSlack = SlackConfig(token: "xoxb-proof", channel: "D0PROOF",
+                                                 label: "@vos")
+
     /// Sample notes across several days, so the tick strip has a real shape.
     private static func seed(_ folder: URL) {
         let calendar = Calendar.current
+        // Two reminders on today: one still waiting on Slack, one already delivered, so
+        // both badge states are on screen in every full render.
+        let stamp: (Int, Int) -> String = { hour, minute in
+            let day = DayKey.today
+            return String(format: "      ↳ slack %04d-%02d-%02d %02d:%02d · Q1PROOF\n",
+                          day.year, day.month, day.day, hour, minute)
+        }
         let content: [(Int, String)] = [
-            (0, "- [ ] !Marina quiere coordinar la prueba el jueves\n- [ ] preguntar a Max si el CUIT del pagador persiste\n- [x] idea: tab de retenciones en el dashboard\n"),
+            (0, "- [ ] !Marina quiere coordinar la prueba el jueves\n"
+                + stamp(23, 55)
+                + "- [ ] preguntar a Max si el CUIT del pagador persiste\n"
+                + stamp(0, 5)
+                + "- [x] idea: tab de retenciones en el dashboard\n"),
             (1, "- [ ] !mandar el doc de integración a MENZE\n- [ ] revisar por qué fc_dup falta en 20 cards\n"),
             (2, "- [x] cerrar el ciclo 3 en Notion\n"),
             (3, "- [ ] pedir a Cumplimiento el guion de aperturas\n- [x] armar el T3 de Odoo\n- [x] chequear rebotes SAMAC\n- [ ] leer la comunicación de BCRA\n"),

@@ -175,4 +175,14 @@ enum DayFormat {
     static func monthYear(_ day: DayKey) -> String {
         "\(months[max(0, min(11, day.month - 1))]) \(day.year)"
     }
+
+    /// `viernes`. Lowercase, so it can sit inside a sentence.
+    static func weekday(_ day: DayKey) -> String {
+        weekdayIndex(day).map { weekdaysLong[$0] } ?? ""
+    }
+
+    /// `15 ago`
+    static func short(_ day: DayKey) -> String {
+        "\(day.day) \(months[max(0, min(11, day.month - 1))])"
+    }
 }
