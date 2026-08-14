@@ -9,10 +9,14 @@ cd "$(dirname "$0")"
 CONFIG="${1:-release}"
 APP="Bloc.app"
 
-echo "==> compilando ($CONFIG)"
-swift build -c "$CONFIG"
+# Homebrew builds run inside Homebrew's sandbox, where SwiftPM's own nested
+# sandbox is rejected. The formula sets BLOC_SWIFT_FLAGS=--disable-sandbox.
+FLAGS=${BLOC_SWIFT_FLAGS:-}
 
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/Bloc"
+echo "==> compilando ($CONFIG)"
+swift build -c "$CONFIG" $FLAGS
+
+BIN="$(swift build -c "$CONFIG" $FLAGS --show-bin-path)/Bloc"
 [ -f "$BIN" ] || { echo "no se encontró el binario en $BIN"; exit 1; }
 
 echo "==> armando $APP"
