@@ -10,6 +10,8 @@ enum Tab: Equatable, Hashable {
 enum FocusTarget: Hashable {
     case capture
     case note(UUID)
+    /// The "cuándo" field of the scheduling row.
+    case schedule
 }
 
 struct ContentView: View {
@@ -24,6 +26,8 @@ struct ContentView: View {
         var tab: Tab = .day(.today)
         var query = ""
         var showUndo = false
+        var scheduling = false
+        var whenDraft = ""
     }
 
     /// Set when the global shortcut could not be registered, so the panel says so instead of
@@ -40,6 +44,8 @@ struct ContentView: View {
         _tab = State(initialValue: initial.tab)
         _draft = State(initialValue: initial.query)
         _showUndo = State(initialValue: initial.showUndo)
+        _scheduling = State(initialValue: initial.scheduling)
+        _whenDraft = State(initialValue: initial.whenDraft)
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -56,6 +62,9 @@ struct ContentView: View {
     @State private var pillHovering = false
     /// The row currently opened to its second level of detail.
     @State private var expandedID: UUID?
+    /// The scheduling row, opened with ⌘⏎ for when the `@cuándo` syntax is not at hand.
+    @State private var scheduling = false
+    @State private var whenDraft = ""
 
     @FocusState private var focus: FocusTarget?
 
@@ -68,12 +77,37 @@ struct ContentView: View {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: Reading the draft
+
+    /// The draft split into the note and the `@cuándo` trailing it. Parsed on every
+    /// keystroke so the create row can show what Enter is about to do.
+    private var capture: When.Capture { When.capture(draft) }
+
+    /// The moment the note is actually going to be sent, or nil when there is nothing to
+    /// send: no time written, Slack not connected, or an hour Slack will not take.
+    ///
+    /// With the scheduling row open that row is the answer, so both ways of committing —
+    /// its button and a plain Enter — end up sending the same note at the same hour. Two
+    /// controls on screen promising two different things is how a user gets surprised.
+    private var reminder: Date? {
+        if scheduling { return scheduleDate }
+        guard store.slackConnected, capture.scheduled else { return nil }
+        return capture.date
+    }
+
+    /// What gets filed. The `@cuándo` is only taken out of the text when it is really going
+    /// to become a reminder; otherwise the user's line is saved exactly as they wrote it.
+    private var noteText: String {
+        (reminder != nil ? capture.text : trimmedDraft)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// One field, two intents: while it holds text the panel is in results mode, showing the
     /// create row plus every note that matches. Empty again, it goes back to browsing days.
     private var searching: Bool { !trimmedDraft.isEmpty }
 
     private var visibleNotes: [Note] {
-        if searching { return store.search(trimmedDraft) }
+        if searching { return store.search(noteText) }
         switch tab {
         case .pending: return store.pending
         case .day(let day): return store.notes(on: day)
@@ -100,6 +134,10 @@ struct ContentView: View {
         VStack(spacing: 0) {
             fieldRow
             Rule()
+            if scheduling {
+                scheduleRow
+                Rule()
+            }
             main
             Rule()
             footer
@@ -152,6 +190,116 @@ struct ContentView: View {
         .padding(.horizontal, Theme.Metric.inset)
     }
 
+    // MARK: Schedule
+
+    /// The long way round to a reminder, opened with ⌘⏎.
+    ///
+    /// The `@cuándo` syntax is faster and it is what the create row teaches, but a syntax
+    /// you have to remember is a syntax that fails you at the exact moment you are in a
+    /// hurry. This row asks the same parser the same question, shows the answer in full
+    /// before committing to it, and offers the four times a reminder is usually wanted.
+    private var scheduleRow: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "paperplane")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.accent)
+                Text(scheduleTitle.uppercased())
+                    .font(.system(size: Theme.Size.label, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(Theme.inkSecondary)
+                Spacer(minLength: 0)
+                Button("Cancelar", action: closeScheduling)
+                    .buttonStyle(TextActionStyle())
+                    .padding(.trailing, -7)
+            }
+
+            HStack(spacing: 6) {
+                ForEach(When.suggestions, id: \.self) { suggestion in
+                    suggestionChip(suggestion)
+                }
+            }
+
+            HStack(spacing: 10) {
+                TextField("mañana 9:30", text: $whenDraft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: Theme.Size.note))
+                    .foregroundStyle(Theme.ink)
+                    .focused($focus, equals: .schedule)
+                    .onSubmit(confirmSchedule)
+                    // The field would otherwise swallow Escape before the panel's own
+                    // handler could close the row.
+                    .onExitCommand(perform: closeScheduling)
+                    .frame(width: 150)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Metric.rowRadius,
+                                         style: .continuous)
+                            .fill(Theme.rowHover))
+                    .accessibilityLabel("Cuándo enviarla a Slack")
+
+                Text(scheduleEcho)
+                    .font(.system(size: Theme.Size.label))
+                    .foregroundStyle(Theme.inkTertiary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Button("Agendar", action: confirmSchedule)
+                    .buttonStyle(TextActionStyle())
+                    .disabled(scheduleDate == nil || trimmedDraft.isEmpty)
+                    .opacity(scheduleDate == nil || trimmedDraft.isEmpty ? 0.4 : 1)
+                    .padding(.trailing, -7)
+            }
+        }
+        .padding(.horizontal, Theme.Metric.inset)
+        .padding(.vertical, 14)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var scheduleTitle: String {
+        store.slackConnected ? "Enviar a Slack" : "Slack no está conectado"
+    }
+
+    private var scheduleDate: Date? {
+        guard store.slackConnected else { return nil }
+        guard let date = When.date(from: whenDraft), date > Date(),
+              date.timeIntervalSinceNow <= When.maxHorizon else { return nil }
+        return date
+    }
+
+    /// Says only what is going wrong. When the words do resolve, the create row underneath
+    /// is already showing the hour in full, and saying it twice made the panel argue with
+    /// itself about which one was the real answer.
+    private var scheduleEcho: String {
+        guard store.slackConnected else { return "corré Bloc --slack-connect" }
+        let trimmed = whenDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "hoy 18:00, mañana 9, lunes, en 2h…" }
+        guard let date = When.date(from: trimmed) else { return "no entendí «\(trimmed)»" }
+        if date <= Date() { return "\(When.label(date)) ya pasó" }
+        if date.timeIntervalSinceNow > When.maxHorizon { return "más de 120 días" }
+        return ""
+    }
+
+    private func suggestionChip(_ suggestion: String) -> some View {
+        Button {
+            whenDraft = suggestion
+            focus = .schedule
+        } label: {
+            Text(suggestion)
+                .font(.system(size: Theme.Size.label))
+                .foregroundStyle(whenDraft == suggestion ? Theme.ink : Theme.inkSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(whenDraft == suggestion
+                                           ? Theme.accentFill : Theme.rowHover))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(PressScaleStyle())
+        .accessibilityLabel("Enviar \(suggestion)")
+    }
+
     // MARK: Main
 
     /// Vertical rhythm, tightest to loosest: inside a note, between notes, between days.
@@ -174,27 +322,46 @@ struct ContentView: View {
 
     /// Always the first row of results mode: Enter files the text as a note no matter what
     /// matches below, so capture speed never depends on what already exists.
+    ///
+    /// When the line ends in a `@cuándo`, the row is also the receipt for it: it shows the
+    /// note without the spec and, underneath, the hour it is going to arrive in Slack. The
+    /// reading and the promise are the same object, so there is no way to press Enter and be
+    /// surprised by what got scheduled.
     private var createRow: some View {
         Button(action: save) {
-            HStack(spacing: 0) {
+            // Baseline, not centre: with a second line under the note the centred glyphs
+            // drifted down and stopped reading as belonging to the note's first line.
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
                 Image(systemName: "plus.circle.fill")
                     .font(.system(size: 17))
                     .foregroundStyle(Theme.accent)
                     // Same column as the checkboxes below, so the create row and the result
                     // rows share their two edges.
                     .frame(width: Theme.Metric.gutter, alignment: .leading)
-                // Regular, not medium: at medium the 15 pt echo weighed the same as the
-                // 17 pt field above it and the panel had two focal points. The orange
-                // plus and the return glyph carry the default-action affordance.
-                Text(trimmedDraft.replacingOccurrences(of: "\n", with: " "))
-                    .font(.system(size: Theme.Size.note, weight: .regular))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                    .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 4 }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    // Regular, not medium: at medium the 15 pt echo weighed the same as the
+                    // 17 pt field above it and the panel had two focal points. The orange
+                    // plus and the return glyph carry the default-action affordance.
+                    Text(noteText.replacingOccurrences(of: "\n", with: " "))
+                        .font(.system(size: Theme.Size.note, weight: .regular))
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let note = captureNote {
+                        Text(note.text)
+                            .font(.system(size: Theme.Size.foot))
+                            .foregroundStyle(note.warning ? Theme.ink : Theme.inkSecondary)
+                            .lineLimit(1)
+                    }
+                }
+
                 Spacer(minLength: Theme.Metric.gap)
-                Image(systemName: "return")
+                Image(systemName: reminder != nil ? "paperplane.fill" : "return")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(reminder != nil ? Theme.accent : Theme.inkTertiary)
+                    .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 3 }
             }
             .padding(.horizontal, Theme.Metric.rowBleed)
             .padding(.vertical, 8)
@@ -204,7 +371,32 @@ struct ContentView: View {
         }
         .buttonStyle(CreateRowStyle())
         .padding(.horizontal, -Theme.Metric.rowBleed)
-        .accessibilityLabel("Crear la nota. \(trimmedDraft)")
+        .accessibilityLabel(createRowLabel)
+    }
+
+    /// The second line of the create row: what is going to happen with the time the user
+    /// wrote. `warning` is for the cases where the note is still saved but nothing is sent,
+    /// which is the one thing the row must never leave implied.
+    private var captureNote: (text: String, warning: Bool)? {
+        // Whatever is actually going to happen wins, whether it came from the `@cuándo` or
+        // from the row below.
+        if let date = reminder { return ("Slack · \(When.label(date))", false) }
+        guard let date = capture.date else { return nil }
+        if !store.slackConnected {
+            return ("Slack no está conectado · se guarda como texto", true)
+        }
+        if capture.past {
+            return ("\(When.label(date)) ya pasó · se guarda como texto", true)
+        }
+        if capture.tooFar {
+            return ("Slack no agenda más allá de 120 días · se guarda como texto", true)
+        }
+        return nil
+    }
+
+    private var createRowLabel: String {
+        guard let date = reminder else { return "Crear la nota. \(noteText)" }
+        return "Crear la nota y enviarla a Slack \(When.label(date)). \(noteText)"
     }
 
     @ViewBuilder
@@ -394,12 +586,21 @@ struct ContentView: View {
                 showDay: groupsByDay,
                 isFocused: focus == .note(note.id),
                 isExpanded: expandedID == note.id,
+                slackConnected: store.slackConnected,
                 onToggle: { toggle(note) },
                 onStar: { star(note) },
                 onDelete: { beginDelete(note) },
                 onEdit: { store.update(note, text: $0) },
                 onExpand: { expandedID = expandedID == note.id ? nil : note.id },
-                onEndEdit: { focus = .note(note.id) }
+                onEndEdit: { focus = .note(note.id) },
+                onSchedule: { date in
+                    store.schedule(note, at: date)
+                    announce("Se envía a Slack \(When.label(date))")
+                },
+                onCancelReminder: {
+                    store.cancelReminder(note)
+                    announce("Recordatorio cancelado")
+                }
             )
             .focused($focus, equals: .note(note.id))
             .onKeyPress(.upArrow) { moveFocus(-1, from: note.id) }
@@ -448,6 +649,11 @@ struct ContentView: View {
                 banner(text: warning, action: nil, actionLabel: nil, isError: true)
             } else if let error = store.writeError {
                 banner(text: error, action: nil, actionLabel: nil, isError: true)
+            } else if let notice = store.slackNotice {
+                // The note is already on disk by the time this appears, so it is news about
+                // the reminder, never about the note. It gets a dismiss and no action.
+                banner(text: notice, action: nil, actionLabel: nil, isError: true,
+                       onDismiss: { store.slackNotice = nil })
             } else if showUndo {
                 banner(text: "Nota borrada", action: undo, actionLabel: "Deshacer",
                        isError: false, onDismiss: dismissUndo)
@@ -481,6 +687,7 @@ struct ContentView: View {
         // from popping the footer down without warning.
         .animation(reduceMotion ? nil : Theme.Motion.state, value: showUndo)
         .animation(reduceMotion ? nil : Theme.Motion.state, value: store.writeError)
+        .animation(reduceMotion ? nil : Theme.Motion.state, value: store.slackNotice)
     }
 
     private func banner(text: String, action: (() -> Void)?, actionLabel: String?,
@@ -541,6 +748,10 @@ struct ContentView: View {
                 .keyboardShortcut("f", modifiers: .command)
             Button("Deshacer borrado") { undo() }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
+            // ⌘⏎ has to travel this way: a plain Return belongs to the capture field, and
+            // the field's own command handler never sees the command-modified one.
+            Button("Enviar a Slack") { scheduling ? closeScheduling() : openScheduling() }
+                .keyboardShortcut(.return, modifiers: .command)
         }
         .opacity(0)
         .frame(width: 0, height: 0)
@@ -549,21 +760,56 @@ struct ContentView: View {
 
     // MARK: Actions
 
-    private func save() {
-        let text = draft
+    /// Enter: whatever the line itself says, including a `@cuándo` if it holds one.
+    private func save() { file(at: nil) }
+
+    /// `date` is the scheduling row's answer, which overrides anything the line implied.
+    private func file(at date: Date?) {
+        let remindAt = date ?? reminder
+        // With an explicit time the `@cuándo` is stripped either way; without one the line
+        // is filed exactly as it was typed.
+        let text = date != nil && capture.date != nil ? capture.text : noteText
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        if store.add(text) {
+
+        if store.add(text, remindAt: remindAt) {
             draft = ""
+            closeScheduling()
             if tab != .pending { tab = .day(.today) }
             expandedID = nil
             dismissUndo()
-            announce("Nota guardada. \(pendingLabel).")
+            if let remindAt {
+                announce("Nota guardada y agendada en Slack para \(When.label(remindAt)).")
+            } else {
+                announce("Nota guardada. \(pendingLabel).")
+            }
         } else if let error = store.writeError {
             // The banner alone is silent for a screen reader, and this is the one moment where
             // the user needs to know their text is still in the field.
             announce(error)
         }
         // On a failed write the draft is deliberately left in the field.
+    }
+
+    /// ⌘⏎ opens the scheduling row, prefilled with whatever the line already implies, so the
+    /// two ways of setting a time are the same time and not two competing answers.
+    private func openScheduling() {
+        guard !trimmedDraft.isEmpty else { return }
+        if whenDraft.isEmpty {
+            whenDraft = capture.spec ?? When.suggestions[2]
+        }
+        scheduling = true
+        focus = .schedule
+    }
+
+    private func closeScheduling() {
+        scheduling = false
+        whenDraft = ""
+        if focus == .schedule { focus = .capture }
+    }
+
+    private func confirmSchedule() {
+        guard let date = scheduleDate else { return }
+        file(at: date)
     }
 
     private func toggle(_ note: Note) {
@@ -688,11 +934,18 @@ struct ContentView: View {
         dismissUndo()
         hoveredDay = nil
         expandedID = nil
+        scheduling = false
+        whenDraft = ""
         focus = .capture
     }
 
-    /// One step back per press: detail closes first, then the search text, then the panel.
+    /// One step back per press: the scheduling row closes first, then the detail, then the
+    /// search text, then the panel.
     private func closeOrCancel() {
+        if scheduling {
+            closeScheduling()
+            return
+        }
         if expandedID != nil {
             expandedID = nil
             return

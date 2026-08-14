@@ -188,6 +188,33 @@ MainActor.assumeIsolated {
     if CommandLine.arguments.contains("--selftest") {
         exit(SelfTest.run())
     }
+    // Slack lives on the command line: connecting is a one-off, and a settings screen the
+    // panel would show once and then carry forever is not worth its weight here.
+    let arguments = CommandLine.arguments
+    func value(after flag: String) -> String? {
+        guard let index = arguments.firstIndex(of: flag), arguments.count > index + 1 else {
+            return nil
+        }
+        // Another flag is a missing value, not a value. Without this, `--slack-connect --to x`
+        // would go off and ask Slack whether "--to" is a valid token.
+        let next = arguments[index + 1]
+        return next.hasPrefix("--") ? nil : next
+    }
+
+    if let token = value(after: "--slack-connect") {
+        exit(SlackSetup.connect(token: token, destination: value(after: "--to")))
+    }
+    if arguments.contains("--slack-status") { exit(SlackSetup.status()) }
+    if arguments.contains("--slack-test") { exit(SlackSetup.test()) }
+    if arguments.contains("--slack-pending") { exit(SlackSetup.pending()) }
+    if arguments.contains("--slack-off") { exit(SlackSetup.disconnect()) }
+    if arguments.contains("--slack-connect") {
+        print("uso: Bloc --slack-connect <token> [--to <mail | U… | C… | #canal>]")
+        print("  el token sale de api.slack.com/apps → OAuth & Permissions")
+        print("  scopes: chat:write, im:write, users:read.email")
+        exit(1)
+    }
+
     if CommandLine.arguments.contains("--shortcut") {
         print("atajo actual: \(Shortcut.current.display)")
         print("para cambiarlo:  Bloc --set-shortcut \"alt+cmd+b\"")
